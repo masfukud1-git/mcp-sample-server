@@ -2,19 +2,16 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import os from 'os';
-import { execSync } from 'child_process';
 
-// 環境変数読み込み
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
-const API_KEY = process.env.API_KEY || 'demo-api-key-12345';
+const API_KEY = process.env.API_KEY || 'default-api-key';
 
-// ミドルウェア
 app.use(express.json({ limit: '10mb' }));
-app.use(cors());
+app.use(cors({ origin: '*', credentials: true }));
 
 // リクエストログ
 app.use((req, res, next) => {
@@ -22,359 +19,211 @@ app.use((req, res, next) => {
   next();
 });
 
-// 認証ミドルウェア
+// 認証ミドルウェア（healthは除外）
 function authenticate(req, res, next) {
+  // Cisco Secure AccessのAI Semantic InspectionはAPI Keyヘッダーを
+  // 検査対象トラフィックに含めるため、認証は維持する
   const apiKey = req.headers['x-api-key'];
-  
-  if (!apiKey) {
-    return res.status(401).json({ 
-      error: 'Unauthorized',
-      message: 'API key required in X-API-Key header'
-    });
+  if (!apiKey || apiKey !== API_KEY) {
+    return res.status(401).json(jsonRpcError(null, -32000, 'Unauthorized'));
   }
-  
-  if (apiKey !== API_KEY) {
-    return res.status(401).json({ 
-      error: 'Unauthorized',
-      message: 'Invalid API key'
-    });
-  }
-  
   next();
 }
 
-// ===== MCPツール実装 =====
-
-// 天気情報取得（ダミーデータ）
-function getWeather(location) {
-  const weatherData = {
-    '東京': { temp: 18, condition: '晴れ', humidity: 60 },
-    'Tokyo': { temp: 18, condition: 'Sunny', humidity: 60 },
-    '大阪': { temp: 20, condition: '曇り', humidity: 65 },
-    'Osaka': { temp: 20, condition: 'Cloudy', humidity: 65 },
-    '福岡': { temp: 22, condition: '雨', humidity: 80 },
-    'Fukuoka': { temp: 22, condition: 'Rainy', humidity: 80 }
-  };
-  
-  const weather = weatherData[location] || { 
-    temp: 15, 
-    condition: '不明', 
-    humidity: 50 
-  };
-  
-  return {
-    content: [{
-      type: "text",
-      text: `${location}の天気情報:
-気温: ${weather.temp}°C
-天候: ${weather.condition}
-湿度: ${weather.humidity}%
-
-※これはダミーデータです`
-    }]
-  };
+// ===== JSON-RPC 2.0 ヘルパー =====
+function jsonRpcSuccess(id, result) {
+  return { jsonrpc: '2.0', id, result };
 }
 
-// 現在時刻取得
-function getCurrentTime() {
-  const now = new Date();
-  return {
-    content: [{
-      type: "text",
-      text: `現在時刻: ${now.toLocaleString('ja-JP', { 
-        timeZone: 'Asia/Tokyo',
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit'
-      })}
-
-タイムゾーン: Asia/Tokyo (JST)
-Unix timestamp: ${now.getTime()}
-ISO 8601: ${now.toISOString()}`
-    }]
-  };
+function jsonRpcError(id, code, message, data) {
+  return { jsonrpc: '2.0', id, error: { code, message, ...(data && { data }) } };
 }
 
-// システム情報取得
-function getSystemInfo() {
-  const cpus = os.cpus();
-  const totalMem = os.totalmem();
-  const freeMem = os.freemem();
-  const usedMem = totalMem - freeMem;
-  
-  return {
-    content: [{
-      type: "text",
-      text: `システム情報:
-
-ホスト名: ${os.hostname()}
-プラットフォーム: ${os.platform()} ${os.release()}
-アーキテクチャ: ${os.arch()}
-CPU: ${cpus[0].model}
-コア数: ${cpus.length}
-総メモリ: ${(totalMem / 1024 / 1024 / 1024).toFixed(2)} GB
-空きメモリ: ${(freeMem / 1024 / 1024 / 1024).toFixed(2)} GB
-使用メモリ: ${(usedMem / 1024 / 1024 / 1024).toFixed(2)} GB (${((usedMem / totalMem) * 100).toFixed(1)}%)
-稼働時間: ${(os.uptime() / 3600).toFixed(2)} 時間`
-    }]
-  };
-}
-
-// 簡単な計算機
-function calculate(expression) {
-  try {
-    // 安全な評価のため、許可された文字のみ
-    if (!/^[\d\s+\-*/().]+$/.test(expression)) {
-      throw new Error('無効な式です。数字と演算子のみ使用できます。');
+// ===== ツール定義 =====
+const TOOLS = [
+  {
+    name: 'get_current_time',
+    description: '現在の日時を取得する',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'get_weather',
+    description: '指定した都市の天気情報を取得する（ダミーデータ）',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        location: { type: 'string', description: '都市名（例: Tokyo, Osaka）' }
+      },
+      required: ['location']
     }
-    
-    const result = eval(expression);
-    
-    return {
-      content: [{
-        type: "text",
-        text: `計算結果:
-式: ${expression}
-答え: ${result}`
-      }]
-    };
-  } catch (error) {
-    return {
-      content: [{
-        type: "text",
-        text: `計算エラー: ${error.message}`
-      }],
-      isError: true
-    };
+  },
+  {
+    name: 'calculate',
+    description: '簡単な四則演算を実行する',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        expression: { type: 'string', description: '計算式（例: 10 + 5 * 2）' }
+      },
+      required: ['expression']
+    }
+  },
+  {
+    name: 'get_random_quote',
+    description: 'ランダムな名言を返す',
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'get_system_info',
+    description: 'サーバーのシステム情報を取得する',
+    inputSchema: { type: 'object', properties: {} }
   }
-}
+];
 
-// ランダムな引用
-function getRandomQuote() {
-  const quotes = [
-    { text: "Learn from yesterday, live for today, hope for tomorrow.", author: "Albert Einstein" },
-    { text: "The only way to do great work is to love what you do.", author: "Steve Jobs" },
-    { text: "Innovation distinguishes between a leader and a follower.", author: "Steve Jobs" },
-    { text: "Stay hungry, stay foolish.", author: "Steve Jobs" },
-    { text: "The future belongs to those who believe in the beauty of their dreams.", author: "Eleanor Roosevelt" }
-  ];
-  
-  const quote = quotes[Math.floor(Math.random() * quotes.length)];
-  
-  return {
-    content: [{
-      type: "text",
-      text: `"${quote.text}"\n\n― ${quote.author}`
-    }]
-  };
-}
-
-// ===== APIエンドポイント =====
-
-// ヘルスチェック（認証不要）
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    timestamp: new Date().toISOString(),
-    version: '1.0.0',
-    server: 'mcp-sample-server'
-  });
-});
-
-// MCP初期化
-app.post('/mcp/initialize', authenticate, (req, res) => {
-  res.json({
-    protocolVersion: "2024-11-05",
-    capabilities: { 
-      tools: {}
-    },
-    serverInfo: { 
-      name: "mcp-sample-server", 
-      version: "1.0.0" 
+// ===== ツール実行ロジック =====
+async function executeTool(name, args = {}) {
+  switch (name) {
+    case 'get_current_time': {
+      const now = new Date();
+      return {
+        content: [{
+          type: 'text',
+          text: `現在時刻: ${now.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })}\nタイムゾーン: Asia/Tokyo (JST)\nUnix timestamp: ${now.getTime()}\nISO 8601: ${now.toISOString()}`
+        }]
+      };
     }
-  });
-});
-
-// ツール一覧
-app.get('/mcp/tools/list', authenticate, (req, res) => {
-  res.json({
-    tools: [
-      {
-        name: "get_weather",
-        description: "指定された場所の天気情報を取得（ダミーデータ）",
-        inputSchema: {
-          type: "object",
-          properties: {
-            location: { 
-              type: "string", 
-              description: "場所（東京、大阪、福岡など）" 
-            }
-          },
-          required: ["location"]
-        }
-      },
-      {
-        name: "get_current_time",
-        description: "現在の日時を取得",
-        inputSchema: { 
-          type: "object", 
-          properties: {} 
-        }
-      },
-      {
-        name: "get_system_info",
-        description: "サーバーのシステム情報を取得",
-        inputSchema: { 
-          type: "object", 
-          properties: {} 
-        }
-      },
-      {
-        name: "calculate",
-        description: "簡単な数式を計算",
-        inputSchema: {
-          type: "object",
-          properties: {
-            expression: { 
-              type: "string", 
-              description: "計算式（例: 2 + 2, 10 * 5 - 3）" 
-            }
-          },
-          required: ["expression"]
-        }
-      },
-      {
-        name: "get_random_quote",
-        description: "ランダムな名言を取得",
-        inputSchema: { 
-          type: "object", 
-          properties: {} 
-        }
+    case 'get_weather': {
+      const location = args.location || 'Unknown';
+      const weathers = ['晴れ', '曇り', '雨', '雪', '快晴'];
+      const weather = weathers[Math.floor(Math.random() * weathers.length)];
+      const temp = Math.floor(Math.random() * 30) + 5;
+      return {
+        content: [{
+          type: 'text',
+          text: `${location}の天気情報:\n天気: ${weather}\n気温: ${temp}°C\n湿度: ${Math.floor(Math.random() * 50) + 30}%\n※これはダミーデータです`
+        }]
+      };
+    }
+    case 'calculate': {
+      const expr = args.expression || '';
+      if (!/^[\d\s\+\-\*\/\(\)\.]+$/.test(expr)) {
+        return {
+          content: [{ type: 'text', text: '計算エラー: 無効な式です。数字と演算子のみ使用できます。' }],
+          isError: true
+        };
       }
-    ]
-  });
-});
-
-// ツール実行
-app.post('/mcp/tools/call', authenticate, (req, res) => {
-  const { name, arguments: args } = req.body;
-  
-  if (!name) {
-    return res.status(400).json({ 
-      error: 'Bad request',
-      message: 'Tool name is required' 
-    });
-  }
-  
-  console.log(`[Tool] Executing: ${name}`, args);
-  
-  let result;
-  
-  try {
-    switch (name) {
-      case 'get_weather':
-        result = getWeather(args.location);
-        break;
-        
-      case 'get_current_time':
-        result = getCurrentTime();
-        break;
-        
-      case 'get_system_info':
-        result = getSystemInfo();
-        break;
-        
-      case 'calculate':
-        result = calculate(args.expression);
-        break;
-        
-      case 'get_random_quote':
-        result = getRandomQuote();
-        break;
-        
-      default:
-        return res.status(400).json({ 
-          error: 'Unknown tool',
-          message: `Tool '${name}' not found` 
-        });
+      try {
+        // eslint-disable-next-line no-eval
+        const result = Function('"use strict"; return (' + expr + ')')();
+        return { content: [{ type: 'text', text: `${expr} = ${result}` }] };
+      } catch {
+        return { content: [{ type: 'text', text: '計算エラー: 式の評価に失敗しました。' }], isError: true };
+      }
     }
-    
-    res.json(result);
-  } catch (error) {
-    console.error(`[Tool Error] ${name}:`, error);
-    res.status(500).json({ 
-      error: 'Internal server error',
-      message: error.message 
-    });
+    case 'get_random_quote': {
+      const quotes = [
+        { text: 'Stay hungry, stay foolish.', author: 'Steve Jobs' },
+        { text: 'The only way to do great work is to love what you do.', author: 'Steve Jobs' },
+        { text: 'In the middle of every difficulty lies opportunity.', author: 'Albert Einstein' },
+        { text: 'It does not matter how slowly you go as long as you do not stop.', author: 'Confucius' },
+        { text: 'Life is what happens when you\'re busy making other plans.', author: 'John Lennon' }
+      ];
+      const q = quotes[Math.floor(Math.random() * quotes.length)];
+      return { content: [{ type: 'text', text: `"${q.text}"\n― ${q.author}` }] };
+    }
+    case 'get_system_info': {
+      return {
+        content: [{
+          type: 'text',
+          text: `OS: ${os.platform()} ${os.release()}\nArch: ${os.arch()}\nNode.js: ${process.version}\nUptime: ${Math.floor(os.uptime() / 3600)}h ${Math.floor((os.uptime() % 3600) / 60)}m\nMemory: ${(os.freemem() / 1024 / 1024 / 1024).toFixed(2)}GB free / ${(os.totalmem() / 1024 / 1024 / 1024).toFixed(2)}GB total`
+        }]
+      };
+    }
+    default:
+      throw { code: -32601, message: `Unknown tool: ${name}` };
+  }
+}
+
+// ===== ヘルスチェック（認証不要）=====
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString(), version: '2.0.0', server: 'mcp-jsonrpc-server' });
+});
+
+// ===== MCP JSON-RPC 2.0 エンドポイント（単一エンドポイント）=====
+app.post('/mcp', authenticate, async (req, res) => {
+  const { jsonrpc, method, params, id } = req.body;
+
+  // JSON-RPC バリデーション
+  if (jsonrpc !== '2.0') {
+    return res.status(400).json(jsonRpcError(id ?? null, -32600, 'Invalid Request: jsonrpc must be "2.0"'));
+  }
+  if (!method) {
+    return res.status(400).json(jsonRpcError(id ?? null, -32600, 'Invalid Request: method is required'));
+  }
+
+  console.log(`[MCP] method=${method} id=${id}`);
+
+  try {
+    switch (method) {
+      // --- initialize ---
+      case 'initialize':
+        return res.json(jsonRpcSuccess(id, {
+          protocolVersion: '2024-11-05',
+          capabilities: { tools: { listChanged: false } },
+          serverInfo: { name: 'mcp-jsonrpc-server', version: '2.0.0' }
+        }));
+
+      // --- notifications/initialized ---
+      case 'notifications/initialized':
+        return res.status(204).end();
+
+      // --- tools/list ---
+      case 'tools/list':
+        return res.json(jsonRpcSuccess(id, { tools: TOOLS }));
+
+      // --- tools/call ---
+      case 'tools/call': {
+        const toolName = params?.name;
+        const toolArgs = params?.arguments ?? {};
+        if (!toolName) {
+          return res.json(jsonRpcError(id, -32602, 'Invalid params: name is required'));
+        }
+        const toolExists = TOOLS.some(t => t.name === toolName);
+        if (!toolExists) {
+          return res.json(jsonRpcError(id, -32601, `Tool not found: ${toolName}`));
+        }
+        const result = await executeTool(toolName, toolArgs);
+        return res.json(jsonRpcSuccess(id, result));
+      }
+
+      // --- ping ---
+      case 'ping':
+        return res.json(jsonRpcSuccess(id, {}));
+
+      default:
+        return res.json(jsonRpcError(id, -32601, `Method not found: ${method}`));
+    }
+  } catch (err) {
+    console.error(`[MCP] Error: ${err.message || JSON.stringify(err)}`);
+    return res.json(jsonRpcError(id, err.code ?? -32000, err.message ?? 'Internal error'));
   }
 });
 
-// サーバー情報
-app.get('/mcp/info', authenticate, (req, res) => {
-  res.json({
-    serverInfo: {
-      name: "mcp-sample-server",
-      version: "1.0.0",
-      hostname: os.hostname(),
-      platform: os.platform(),
-      nodeVersion: process.version
-    },
-    uptime: process.uptime(),
-    memory: process.memoryUsage()
-  });
-});
-
-// 404ハンドラ
+// 404
 app.use((req, res) => {
-  res.status(404).json({ 
-    error: 'Not found',
-    message: 'Endpoint not found' 
-  });
-});
-
-// エラーハンドラ
-app.use((err, req, res, next) => {
-  console.error('[Server Error]:', err);
-  res.status(500).json({ 
-    error: 'Internal server error',
-    message: err.message 
-  });
+  res.status(404).json({ error: 'Not found' });
 });
 
 // サーバー起動
 const server = app.listen(PORT, HOST, () => {
-  console.log('='.repeat(60));
-  console.log('MCP Sample Server');
-  console.log('='.repeat(60));
+  console.log('='.repeat(50));
+  console.log('MCP JSON-RPC 2.0 Server');
   console.log(`URL: http://${HOST}:${PORT}`);
-  console.log(`API Key: ${API_KEY}`);
-  console.log('='.repeat(60));
-  console.log('\nAvailable endpoints:');
-  console.log('  GET  /health                 - Health check');
-  console.log('  POST /mcp/initialize         - Initialize MCP');
-  console.log('  GET  /mcp/tools/list         - List tools');
-  console.log('  POST /mcp/tools/call         - Call tool');
-  console.log('  GET  /mcp/info               - Server info');
-  console.log('='.repeat(60));
-  console.log('\nServer is ready!');
+  console.log(`Endpoints:`);
+  console.log(`  GET  /health  - Health check (no auth)`);
+  console.log(`  POST /mcp     - JSON-RPC 2.0 endpoint`);
+  console.log('='.repeat(50));
 });
 
-// グレースフルシャットダウン
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, closing server...');
-  server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
-  });
-});
-
-process.on('SIGINT', () => {
-  console.log('SIGINT received, closing server...');
-  server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
-  });
-});
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
